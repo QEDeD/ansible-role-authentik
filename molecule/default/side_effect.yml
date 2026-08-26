@@ -1,0 +1,307 @@
+# SPDX-FileCopyrightText: 2026 MASH project contributors
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+- name: Exercise authentik systemd readiness behavior
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    authentik_readiness_test_server_service: authentik-server.service
+    authentik_readiness_test_worker_service: authentik-worker.service
+    authentik_readiness_test_server_container: authentik-server
+    authentik_readiness_test_postgres_container: postgres
+    authentik_readiness_test_network: authentik
+    authentik_readiness_test_dropin_directory: /run/systemd/system/authentik-server.service.d
+    authentik_readiness_test_dropin_path: "{{ authentik_readiness_test_dropin_directory }}/readiness-test.conf"
+    authentik_readiness_test_url: http://localhost:9000/-/health/ready/
+
+  tasks:
+    - name: Read the installed authentik server unit  # noqa command-instead-of-module
+      ansible.builtin.command:
+        cmd: systemctl cat authentik-server.service
+      register: authentik_readiness_server_unit
+      changed_when: false
+
+    - name: Read the installed authentik worker unit  # noqa command-instead-of-module
+      ansible.builtin.command:
+        cmd: systemctl cat authentik-worker.service
+      register: authentik_readiness_worker_unit
+      changed_when: false
+
+    - name: Assert the server unit encodes the application-readiness contract
+      ansible.builtin.assert:
+        that:
+          - "'Type=simple' in authentik_readiness_server_unit.stdout"
+          - "'ExecStartPost=' in authentik_readiness_server_unit.stdout"
+          - "'/-/health/ready/' in authentik_readiness_server_unit.stdout"
+          - "'/authentik-test/-/health/ready/' not in authentik_readiness_server_unit.stdout"
+          - "'$MAINPID' in authentik_readiness_server_unit.stdout"
+          - "'127.0.0.1' in authentik_readiness_server_unit.stdout"
+          - "'9000' in authentik_readiness_server_unit.stdout"
+          - "'TimeoutStartSec=900s' in authentik_readiness_server_unit.stdout"
+          - "authentik_readiness_server_unit.stdout is search('ExecStop=.*docker stop -t [0-9]+ authentik-server')"
+          - "'ExecStopPost=' in authentik_readiness_server_unit.stdout"
+          - "'docker rm -f authentik-server' in authentik_readiness_server_unit.stdout"
+          - "authentik_readiness_server_unit.stdout.find('ExecStop=') < authentik_readiness_server_unit.stdout.find('ExecStopPost=')"
+          - "'Restart=always' in authentik_readiness_server_unit.stdout"
+          - "'RestartSec=30' in authentik_readiness_server_unit.stdout"
+        fail_msg: "The installed authentik server unit does not encode the expected readiness, cleanup, and restart behavior"
+
+    - name: Assert the independent worker unit was not given the server readiness barrier
+      ansible.builtin.assert:
+        that:
+          - "'ExecStartPost=' not in authentik_readiness_worker_unit.stdout"
+          - "'TimeoutStartSec=' not in authentik_readiness_worker_unit.stdout"
+          - "'Requires=authentik-server.service' in authentik_readiness_worker_unit.stdout"
+          - "'After=authentik-server.service' in authentik_readiness_worker_unit.stdout"
+          - "'Restart=always' in authentik_readiness_worker_unit.stdout"
+          - "'RestartSec=30' in authentik_readiness_worker_unit.stdout"
+        fail_msg: "The authentik worker unit no longer preserves its independent service contract"
+
+    - name: Create the runtime systemd override directory for failure tests
+      ansible.builtin.file:
+        path: "{{ authentik_readiness_test_dropin_directory }}"
+        state: directory
+        mode: "0755"
+
+    - name: Disable automatic restart while testing MAINPID failure
+      ansible.builtin.copy:
+        dest: "{{ authentik_readiness_test_dropin_path }}"
+        mode: "0644"
+        content: |
+          [Service]
+          Restart=no
+
+    - name: Reload systemd for the MAINPID failure override
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Verify MAINPID death fails startup and removes the container
+      block:
+        - name: Stop the authentik worker before the MAINPID failure test
+          ansible.builtin.systemd_service:
+            name: "{{ authentik_readiness_test_worker_service }}"
+            state: stopped
+
+        - name: Stop the authentik server before the MAINPID failure test
+          ansible.builtin.systemd_service:
+            name: "{{ authentik_readiness_test_server_service }}"
+            state: stopped
+
+        - name: Disconnect Postgres to hold authentik below application readiness  # noqa command-instead-of-module
+          ansible.builtin.command:
+            cmd: >-
+              docker network disconnect
+              {{ authentik_readiness_test_network }}
+              {{ authentik_readiness_test_postgres_container }}
+          changed_when: true
+
+        - name: Start the authentik server without waiting for readiness
+          ansible.builtin.systemd_service:
+            name: "{{ authentik_readiness_test_server_service }}"
+            state: started
+            no_block: true
+
+        - name: Wait for the server unit to enter its post-start readiness phase
+          ansible.builtin.systemd_service:
+            name: "{{ authentik_readiness_test_server_service }}"
+          register: authentik_readiness_activating_service
+          until:
+            - authentik_readiness_activating_service.status.ActiveState == 'activating'
+            - authentik_readiness_activating_service.status.SubState == 'start-post'
+            - authentik_readiness_activating_service.status.MainPID | int > 0
+          retries: 30
+          delay: 1
+
+        - name: Terminate the server MAINPID during readiness polling
+          ansible.builtin.command:
+            cmd: "kill -TERM {{ authentik_readiness_activating_service.status.MainPID }}"
+          changed_when: true
+
+        - name: Wait for MAINPID death to fail the server startup
+          ansible.builtin.systemd_service:
+            name: "{{ authentik_readiness_test_server_service }}"
+          register: authentik_readiness_mainpid_failure
+          until: authentik_readiness_mainpid_failure.status.ActiveState == 'failed'
+          retries: 15
+          delay: 1
+
+        - name: Wait for failed-start cleanup to remove the server container  # noqa command-instead-of-module
+          ansible.builtin.command:
+            cmd: "docker container inspect {{ authentik_readiness_test_server_container }}"
+          register: authentik_readiness_mainpid_container
+          changed_when: false
+          failed_when: false
+          until: authentik_readiness_mainpid_container.rc != 0
+          retries: 15
+          delay: 1
+
+        - name: Assert MAINPID death failed promptly and cleaned up
+          ansible.builtin.assert:
+            that:
+              - authentik_readiness_mainpid_failure.status.ActiveState == 'failed'
+              - authentik_readiness_mainpid_container.rc != 0
+            fail_msg: "MAINPID death did not fail startup promptly and remove the authentik server container"
+      always:
+        - name: Stop the server after the MAINPID failure test
+          ansible.builtin.systemd_service:
+            name: "{{ authentik_readiness_test_server_service }}"
+            state: stopped
+          failed_when: false
+
+        - name: Reconnect Postgres after the MAINPID failure test  # noqa command-instead-of-module
+          ansible.builtin.command:
+            cmd: >-
+              docker network connect
+              {{ authentik_readiness_test_network }}
+              {{ authentik_readiness_test_postgres_container }}
+          register: authentik_readiness_mainpid_reconnect
+          changed_when: authentik_readiness_mainpid_reconnect.rc == 0
+          failed_when:
+            - authentik_readiness_mainpid_reconnect.rc != 0
+            - "'already exists' not in authentik_readiness_mainpid_reconnect.stderr"
+
+        - name: Reset the server failure after the MAINPID test  # noqa command-instead-of-module
+          ansible.builtin.command:
+            cmd: systemctl reset-failed authentik-server.service
+          changed_when: false
+
+    - name: Set a short startup ceiling for the timeout failure test
+      ansible.builtin.copy:
+        dest: "{{ authentik_readiness_test_dropin_path }}"
+        mode: "0644"
+        content: |
+          [Service]
+          Restart=no
+          TimeoutStartSec=5s
+
+    - name: Reload systemd for the timeout failure override
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Verify the startup ceiling fails readiness and removes the container
+      block:
+        - name: Disconnect Postgres to hold authentik below readiness until timeout  # noqa command-instead-of-module
+          ansible.builtin.command:
+            cmd: >-
+              docker network disconnect
+              {{ authentik_readiness_test_network }}
+              {{ authentik_readiness_test_postgres_container }}
+          changed_when: true
+
+        - name: Start the authentik server and allow the bounded readiness wait to fail
+          ansible.builtin.systemd_service:
+            name: "{{ authentik_readiness_test_server_service }}"
+            state: started
+          register: authentik_readiness_timeout_start
+          failed_when: false
+
+        - name: Wait for the startup timeout to fail the server unit
+          ansible.builtin.systemd_service:
+            name: "{{ authentik_readiness_test_server_service }}"
+          register: authentik_readiness_timeout_failure
+          until: authentik_readiness_timeout_failure.status.ActiveState == 'failed'
+          retries: 15
+          delay: 1
+
+        - name: Wait for timeout cleanup to remove the server container  # noqa command-instead-of-module
+          ansible.builtin.command:
+            cmd: "docker container inspect {{ authentik_readiness_test_server_container }}"
+          register: authentik_readiness_timeout_container
+          changed_when: false
+          failed_when: false
+          until: authentik_readiness_timeout_container.rc != 0
+          retries: 15
+          delay: 1
+
+        - name: Assert the startup timeout failed and cleaned up
+          ansible.builtin.assert:
+            that:
+              - authentik_readiness_timeout_failure.status.ActiveState == 'failed'
+              - authentik_readiness_timeout_container.rc != 0
+            fail_msg: "The startup timeout did not fail the unit and remove the authentik server container"
+      always:
+        - name: Stop the server after the timeout failure test
+          ansible.builtin.systemd_service:
+            name: "{{ authentik_readiness_test_server_service }}"
+            state: stopped
+          failed_when: false
+
+        - name: Reconnect Postgres after the timeout failure test  # noqa command-instead-of-module
+          ansible.builtin.command:
+            cmd: >-
+              docker network connect
+              {{ authentik_readiness_test_network }}
+              {{ authentik_readiness_test_postgres_container }}
+          register: authentik_readiness_timeout_reconnect
+          changed_when: authentik_readiness_timeout_reconnect.rc == 0
+          failed_when:
+            - authentik_readiness_timeout_reconnect.rc != 0
+            - "'already exists' not in authentik_readiness_timeout_reconnect.stderr"
+
+        - name: Remove the runtime startup-failure override
+          ansible.builtin.file:
+            path: "{{ authentik_readiness_test_dropin_path }}"
+            state: absent
+
+        - name: Reload systemd after removing the failure-test override
+          ansible.builtin.systemd_service:
+            daemon_reload: true
+
+        - name: Reset the server failure after the timeout test  # noqa command-instead-of-module
+          ansible.builtin.command:
+            cmd: systemctl reset-failed authentik-server.service
+          changed_when: false
+
+    - name: Start the authentik server through the normal readiness barrier
+      ansible.builtin.systemd_service:
+        name: "{{ authentik_readiness_test_server_service }}"
+        state: started
+
+    - name: Verify blocking startup returned only after application readiness
+      ansible.builtin.uri:
+        url: "{{ authentik_readiness_test_url }}"
+        method: GET
+        status_code: [200]
+
+    - name: Start the authentik worker after server readiness
+      ansible.builtin.systemd_service:
+        name: "{{ authentik_readiness_test_worker_service }}"
+        state: started
+
+    - name: Exercise the preserved normal graceful stop path
+      block:
+        - name: Stop the authentik worker before the normal server stop
+          ansible.builtin.systemd_service:
+            name: "{{ authentik_readiness_test_worker_service }}"
+            state: stopped
+
+        - name: Stop the authentik server normally
+          ansible.builtin.systemd_service:
+            name: "{{ authentik_readiness_test_server_service }}"
+            state: stopped
+
+        - name: Check that normal stop removed the server container  # noqa command-instead-of-module
+          ansible.builtin.command:
+            cmd: "docker container inspect {{ authentik_readiness_test_server_container }}"
+          register: authentik_readiness_normal_stop_container
+          changed_when: false
+          failed_when: false
+
+        - name: Assert normal stop removed the server container
+          ansible.builtin.assert:
+            that: authentik_readiness_normal_stop_container.rc != 0
+            fail_msg: "Normal stop left the authentik server container behind"
+      always:
+        - name: Start the authentik server after the normal-stop test
+          ansible.builtin.systemd_service:
+            name: "{{ authentik_readiness_test_server_service }}"
+            state: started
+
+        - name: Start the authentik worker after the normal-stop test
+          ansible.builtin.systemd_service:
+            name: "{{ authentik_readiness_test_worker_service }}"
+            state: started

@@ -236,6 +236,24 @@ authentik_server_systemd_wanted_services_list_default: []
 authentik_server_systemd_wanted_services_list_auto: []
 authentik_server_systemd_wanted_services_list_custom: []
 
+# Controls how long systemd waits for authentik to become application-ready.
+# Authentik database migrations can legitimately take several minutes. The default is a
+# bounded 15-minute safety ceiling, not a measured startup percentile or expected duration.
+# Override it only when an environment has evidence for a different migration window.
+authentik_server_startup_timeout_seconds: 900
+
+# Shell command used in the systemd post-start phase to wait until authentik can
+# reach its database. The server process tracked by systemd must remain alive both
+# while polling and after the successful readiness response.
+authentik_server_readiness_command: |
+  while kill -0 "$MAINPID" 2>/dev/null; do
+  if {{ devture_systemd_docker_base_host_command_docker }} exec {{ authentik_server_identifier }} python -c "import http.client, sys; connection = http.client.HTTPConnection(\"127.0.0.1\", {{ authentik_container_http_port }}, timeout=2); connection.request(\"GET\", \"/-/health/ready/\"); sys.exit(0 if connection.getresponse().status == 200 else 1)" >/dev/null 2>&1; then
+  kill -0 "$MAINPID" 2>/dev/null && exit 0;
+  fi;
+  sleep 2;
+  done;
+  exit 1
+
 # Controls how long to wait for the container to stop gracefully before killing it.
 authentik_server_container_stop_grace_time_seconds: "{{ devture_systemd_docker_base_container_stop_grace_time_seconds }}"
 

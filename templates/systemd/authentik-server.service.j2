@@ -46,9 +46,12 @@ ExecStartPre={{ devture_systemd_docker_base_host_command_docker }} network conne
 {% endfor %}
 
 ExecStart={{ devture_systemd_docker_base_host_command_docker }} start --attach {{ authentik_server_identifier }}
+ExecStartPost={{ devture_systemd_docker_base_host_command_sh }} -c '{{ authentik_server_readiness_command | trim | replace("\n", " ") }}'
+TimeoutStartSec={{ authentik_server_startup_timeout_seconds }}s
 
 ExecStop=-{{ devture_systemd_docker_base_host_command_sh }} -c '{{ devture_systemd_docker_base_host_command_docker }} stop -t {{ devture_systemd_docker_base_container_stop_grace_time_seconds }} {{ authentik_server_identifier }} 2>/dev/null || true'
 ExecStop=-{{ devture_systemd_docker_base_host_command_sh }} -c '{{ devture_systemd_docker_base_host_command_docker }} rm {{ authentik_server_identifier }} 2>/dev/null || true'
+ExecStopPost=-{{ devture_systemd_docker_base_host_command_sh }} -c '{{ devture_systemd_docker_base_host_command_docker }} rm -f {{ authentik_server_identifier }} >/dev/null 2>&1 || true'
 Restart=always
 RestartSec=30
 SyslogIdentifier={{ authentik_server_identifier }}

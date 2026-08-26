@@ -52,6 +52,13 @@
   with_items:
     - authentik_email_port
 
+- name: Fail if the authentik server startup timeout is not a positive integer
+  ansible.builtin.fail:
+    msg: >-
+      authentik_server_startup_timeout_seconds (`{{ authentik_server_startup_timeout_seconds }}`)
+      must be a positive integer number of seconds.
+  when: (authentik_server_startup_timeout_seconds | string | regex_search('^[1-9][0-9]*$')) is none
+
 - name: Run if Traefik is enabled
   when: authentik_container_labels_traefik_enabled | bool
   block:

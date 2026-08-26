@@ -37,6 +37,7 @@ provisioner:
         authentik_uid: 1000
         authentik_gid: 1000
         authentik_hostname: localhost
+        authentik_path_prefix: /authentik-test
         authentik_container_labels_traefik_enabled: false
         authentik_container_http_host_bind_port: 9000
         authentik_secret_key: secret
