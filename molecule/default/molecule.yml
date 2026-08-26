@@ -40,6 +40,8 @@ provisioner:
         authentik_path_prefix: /authentik-test
         authentik_container_labels_traefik_enabled: false
         authentik_container_http_host_bind_port: 9000
+        # Diagnostic-only ceiling. The production-facing default remains 900 seconds.
+        authentik_server_startup_timeout_seconds: 240
         authentik_secret_key: secret
 
         # Variables required for authentik to connect to the Postgres database.
