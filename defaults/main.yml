@@ -246,9 +246,11 @@ authentik_server_startup_timeout_seconds: 900
 # reach its database. Any successful HTTP 2xx response satisfies Authentik's readiness
 # contract. The server process tracked by systemd must remain alive both while
 # polling and after the successful readiness response.
+# Keep the Python string-literal quotes escaped through systemd's command parser
+# so that the nested `sh -c` receives a valid `python -c` argument.
 authentik_server_readiness_command: |
   while kill -0 "$MAINPID" 2>/dev/null; do
-  if {{ devture_systemd_docker_base_host_command_docker }} exec {{ authentik_server_identifier }} python -c "import http.client, sys; connection = http.client.HTTPConnection(\"127.0.0.1\", {{ authentik_container_http_port }}, timeout=2); connection.request(\"GET\", \"/-/health/ready/\"); response = connection.getresponse(); sys.exit(0 if 200 <= response.status < 300 else 1)" >/dev/null 2>&1; then
+  if {{ devture_systemd_docker_base_host_command_docker }} exec {{ authentik_server_identifier }} python -c "import http.client, sys; connection = http.client.HTTPConnection(\\\"127.0.0.1\\\", {{ authentik_container_http_port }}, timeout=2); connection.request(\\\"GET\\\", \\\"/-/health/ready/\\\"); response = connection.getresponse(); sys.exit(0 if 200 <= response.status < 300 else 1)" >/dev/null 2>&1; then
   kill -0 "$MAINPID" 2>/dev/null && exit 0;
   fi;
   sleep 2;
