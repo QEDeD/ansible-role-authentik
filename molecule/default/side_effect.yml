@@ -38,6 +38,7 @@
           - "'ExecStartPost=' in authentik_readiness_server_unit.stdout"
           - "'/-/health/ready/' in authentik_readiness_server_unit.stdout"
           - "'/authentik-test/-/health/ready/' not in authentik_readiness_server_unit.stdout"
+          - "'200 <= response.status < 300' in authentik_readiness_server_unit.stdout"
           - "'$MAINPID' in authentik_readiness_server_unit.stdout"
           - "'127.0.0.1' in authentik_readiness_server_unit.stdout"
           - "'9000' in authentik_readiness_server_unit.stdout"
