@@ -60,6 +60,7 @@
               - --property=ControlPID
               - --property=ExecMainCode
               - --property=ExecMainStatus
+              - --property=ExecStartPost
               - --property=StateChangeTimestamp
           register: authentik_diagnostic_systemd
           changed_when: false
@@ -81,11 +82,11 @@
         - name: Read the server container process tree  # noqa command-instead-of-module
           ansible.builtin.command:
             argv:
-              - docker
-              - top
-              - authentik-server
-              - -eo
-              - pid,ppid,stat,etime,comm,args
+              - systemctl
+              - status
+              - authentik-server.service
+              - --no-pager
+              - --lines=5
           register: authentik_diagnostic_processes
           changed_when: false
           failed_when: false
@@ -213,6 +214,57 @@
                 rc: "{{ authentik_diagnostic_journal.rc }}"
                 stdout: "{{ authentik_diagnostic_journal.stdout_lines }}"
                 stderr: "{{ authentik_diagnostic_journal.stderr_lines }}"
+
+        - name: Allow the readiness loop to observe the successful probe
+          ansible.builtin.pause:
+            seconds: 15
+
+        - name: Read systemd state after the readiness transition window  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - systemctl
+              - show
+              - authentik-server.service
+              - --property=ActiveState
+              - --property=SubState
+              - --property=Result
+              - --property=MainPID
+              - --property=ControlPID
+              - --property=ExecStartPost
+          register: authentik_diagnostic_transition_systemd
+          changed_when: false
+          failed_when: false
+
+        - name: Probe readiness after the transition window  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - authentik-server
+              - python
+              - -c
+              - >-
+                import http.client, sys;
+                connection = http.client.HTTPConnection("127.0.0.1", 9000, timeout=3);
+                connection.request("GET", "/-/health/ready/");
+                response = connection.getresponse();
+                print(response.status);
+                sys.exit(0 if 200 <= response.status < 300 else 1)
+          register: authentik_diagnostic_transition_readiness
+          changed_when: false
+          failed_when: false
+
+        - name: Report the post-readiness systemd transition
+          ansible.builtin.debug:
+            msg:
+              systemd:
+                rc: "{{ authentik_diagnostic_transition_systemd.rc }}"
+                stdout: "{{ authentik_diagnostic_transition_systemd.stdout_lines }}"
+                stderr: "{{ authentik_diagnostic_transition_systemd.stderr_lines }}"
+              readiness:
+                rc: "{{ authentik_diagnostic_transition_readiness.rc }}"
+                stdout: "{{ authentik_diagnostic_transition_readiness.stdout_lines }}"
+                stderr: "{{ authentik_diagnostic_transition_readiness.stderr_lines }}"
 
         - name: End the diagnostic run after preserving startup evidence
           ansible.builtin.fail:
