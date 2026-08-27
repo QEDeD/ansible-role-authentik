@@ -8,53 +8,6 @@
   hosts: all
   become: true
   gather_facts: true
-  vars:
-    # Diagnostic-only wrapper for measuring how long Docker retains the exact
-    # container name after failed-start cleanup. The production default remains
-    # unchanged, and the complete docker-create argv is still passed as "$@".
-    authentik_server_container_create_command: |
-      first_create_attempt_ns=$(date +%s%N);
-      first_create_attempt=$(date --utc +%Y-%m-%dT%H:%M:%S.%NZ);
-      deadline_ns=$((first_create_attempt_ns + 60000000000));
-      first_name_conflict=;
-      first_name_conflict_ns=;
-      conflict_attempts=0;
-      while :; do
-      if create_output=$("$@" 2>&1); then
-      first_create_success_ns=$(date +%s%N);
-      first_create_success=$(date --utc +%Y-%m-%dT%H:%M:%S.%NZ);
-      echo "$create_output";
-      if [ -n "$first_name_conflict_ns" ]; then
-      conflict_duration_ns=$((first_create_success_ns - first_name_conflict_ns));
-      conflict_duration_seconds=$(printf '%s.%09d' "$((conflict_duration_ns / 1000000000))" "$((conflict_duration_ns % 1000000000))");
-      echo "AUTHENTIK_NAME_RELEASE FIRST_CREATE_ATTEMPT=$first_create_attempt FIRST_CREATE_ATTEMPT_NS=$first_create_attempt_ns FIRST_NAME_CONFLICT=$first_name_conflict FIRST_NAME_CONFLICT_NS=$first_name_conflict_ns FIRST_CREATE_SUCCESS=$first_create_success FIRST_CREATE_SUCCESS_NS=$first_create_success_ns CONFLICT_DURATION_SECONDS=$conflict_duration_seconds CONFLICT_ATTEMPTS=$conflict_attempts" >&2;
-      fi;
-      exit 0;
-      fi;
-      case "$create_output" in
-      *"Conflict. The container name"*"is already in use by container"*)
-      conflict_attempts=$((conflict_attempts + 1));
-      if [ -z "$first_name_conflict_ns" ]; then
-      first_name_conflict_ns=$(date +%s%N);
-      first_name_conflict=$(date --utc +%Y-%m-%dT%H:%M:%S.%NZ);
-      fi;
-      now_ns=$(date +%s%N);
-      if [ "$now_ns" -ge "$deadline_ns" ]; then
-      conflict_duration_ns=$((now_ns - first_name_conflict_ns));
-      conflict_duration_seconds=$(printf '%s.%09d' "$((conflict_duration_ns / 1000000000))" "$((conflict_duration_ns % 1000000000))");
-      echo "$create_output" >&2;
-      echo "AUTHENTIK_NAME_RELEASE FIRST_CREATE_ATTEMPT=$first_create_attempt FIRST_CREATE_ATTEMPT_NS=$first_create_attempt_ns FIRST_NAME_CONFLICT=$first_name_conflict FIRST_NAME_CONFLICT_NS=$first_name_conflict_ns FIRST_CREATE_SUCCESS=NONE FIRST_CREATE_SUCCESS_NS=NONE CONFLICT_DURATION_SECONDS=$conflict_duration_seconds CONFLICT_ATTEMPTS=$conflict_attempts" >&2;
-      echo "Failed to create container authentik-server within the 60-second diagnostic window because Docker did not release its name" >&2;
-      exit 1;
-      fi;
-      sleep 1;
-      ;;
-      *)
-      echo "$create_output" >&2;
-      exit 1;
-      ;;
-      esac;
-      done
   tasks:
     - name: Include roles for authentik Molecule tests
       ansible.builtin.include_role:

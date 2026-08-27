@@ -213,12 +213,33 @@
               {{ authentik_readiness_test_postgres_container }}
           changed_when: true
 
-        - name: Start the authentik server and allow the bounded readiness wait to fail
+        - name: Start the authentik server without waiting for the bounded readiness failure
           ansible.builtin.systemd_service:
             name: "{{ authentik_readiness_test_server_service }}"
             state: started
-          register: authentik_readiness_timeout_start
-          failed_when: false
+            no_block: true
+
+        - name: Wait for the timeout test to reach post-start readiness polling
+          ansible.builtin.systemd_service:
+            name: "{{ authentik_readiness_test_server_service }}"
+          register: authentik_readiness_timeout_activating_service
+          until:
+            - authentik_readiness_timeout_activating_service.status.ActiveState == 'activating'
+            - authentik_readiness_timeout_activating_service.status.SubState == 'start-post'
+            - authentik_readiness_timeout_activating_service.status.MainPID | int > 0
+          retries: 15
+          delay: 1
+
+        - name: Record the failed-start container ID before timeout cleanup  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - docker
+              - container
+              - inspect
+              - --format={% raw %}{{.Id}}{% endraw %}
+              - "{{ authentik_readiness_test_server_container }}"
+          register: authentik_readiness_failed_start_container_id
+          changed_when: false
 
         - name: Wait for the startup timeout to fail the server unit
           ansible.builtin.systemd_service:
@@ -243,6 +264,7 @@
             that:
               - authentik_readiness_timeout_failure.status.ActiveState == 'failed'
               - authentik_readiness_timeout_container.rc != 0
+              - authentik_readiness_failed_start_container_id.stdout | length == 64
             fail_msg: "The startup timeout did not fail the unit and remove the authentik server container"
       always:
         - name: Stop the server after the timeout failure test
@@ -263,12 +285,15 @@
             - authentik_readiness_timeout_reconnect.rc != 0
             - "'already exists' not in authentik_readiness_timeout_reconnect.stderr"
 
-        - name: Remove the runtime startup-failure override
-          ansible.builtin.file:
-            path: "{{ authentik_readiness_test_dropin_path }}"
-            state: absent
+        - name: Preserve only restart suppression for the explicit restoration diagnostic
+          ansible.builtin.copy:
+            dest: "{{ authentik_readiness_test_dropin_path }}"
+            mode: "0644"
+            content: |
+              [Service]
+              Restart=no
 
-        - name: Reload systemd after removing the failure-test override
+        - name: Reload systemd for the explicit restoration diagnostic
           ansible.builtin.systemd_service:
             daemon_reload: true
 
@@ -277,77 +302,135 @@
             cmd: systemctl reset-failed authentik-server.service
           changed_when: false
 
-    - name: Start the authentik server through the normal readiness barrier
-      ansible.builtin.systemd_service:
-        name: "{{ authentik_readiness_test_server_service }}"
-        state: started
+    - name: Measure external Docker name release and explicit restoration
+      block:
+        - name: Record the immediate restoration start time  # noqa command-instead-of-module
+          ansible.builtin.command:
+            cmd: date +%s
+          register: authentik_readiness_immediate_restore_t0
+          changed_when: false
 
-    - name: Read the measured create-retry lifecycle from the server journal  # noqa command-instead-of-module
-      ansible.builtin.command:
-        cmd: >-
-          journalctl
-          --unit={{ authentik_readiness_test_server_service }}
-          --since=@{{ authentik_readiness_name_release_observation_start.stdout }}
-          --no-pager
-          --output=cat
-      register: authentik_readiness_name_release_journal
-      changed_when: false
+        - name: Attempt immediate restoration through the real server unit  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - systemctl
+              - start
+              - "{{ authentik_readiness_test_server_service }}"
+          register: authentik_readiness_immediate_restore
+          changed_when: false
+          failed_when: false
 
-    - name: Select successful exact-name-conflict measurements
-      ansible.builtin.set_fact:
-        authentik_readiness_name_release_measurements: >-
-          {{
-            authentik_readiness_name_release_journal.stdout_lines
-            | select('match', '^AUTHENTIK_NAME_RELEASE .* FIRST_CREATE_SUCCESS=[^N]')
-            | list
-          }}
+        - name: Read the immediate restoration journal  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - journalctl
+              - "--unit={{ authentik_readiness_test_server_service }}"
+              - "--since=@{{ authentik_readiness_immediate_restore_t0.stdout }}"
+              - --no-pager
+              - --output=cat
+          register: authentik_readiness_immediate_restore_journal
+          changed_when: false
 
-    - name: Require the immediate restoration to exercise and recover from the name conflict
-      ansible.builtin.assert:
-        that:
-          - authentik_readiness_name_release_measurements | length > 0
-        fail_msg: >-
-          The immediate restoration did not produce a successful exact-name-conflict
-          measurement within the diagnostic window.
+        - name: Require the immediate restoration to fail on the exact Docker name conflict
+          ansible.builtin.assert:
+            that:
+              - authentik_readiness_immediate_restore.rc != 0
+              - "'Conflict. The container name' in authentik_readiness_immediate_restore_journal.stdout"
+              - "'is already in use by container' in authentik_readiness_immediate_restore_journal.stdout"
+              - "'Failed to create container authentik-server' in authentik_readiness_immediate_restore_journal.stdout"
+            fail_msg: >-
+              The immediate explicit restoration did not fail on the established
+              exact Docker container-name conflict.
 
-    - name: Record the end of the timeout-failure lifecycle observation  # noqa command-instead-of-module
-      ansible.builtin.command:
-        cmd: date +%s
-      register: authentik_readiness_name_release_observation_end
-      changed_when: false
+        - name: Poll the failed-start container's Docker destroy event  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - timeout
+              - 2s
+              - docker
+              - events
+              - "--since={{ authentik_readiness_name_release_observation_start.stdout }}"
+              - "--filter=container={{ authentik_readiness_failed_start_container_id.stdout }}"
+              - --filter=event=destroy
+              - --format={% raw %}{{.Time}}|{{.Action}}|{{.ID}}{% endraw %}
+          register: authentik_readiness_destroy_event
+          changed_when: false
+          failed_when: false
+          until: authentik_readiness_destroy_event.stdout_lines | length > 0
+          retries: 25
+          delay: 0
 
-    - name: Read Docker events for the failed-start and restoration lifecycle  # noqa command-instead-of-module
-      ansible.builtin.command:
-        cmd: >-
-          docker events
-          --since={{ authentik_readiness_name_release_observation_start.stdout }}
-          --until={{ authentik_readiness_name_release_observation_end.stdout }}
-          --filter=container={{ authentik_readiness_test_server_container }}
-          --format='{% raw %}{{.TimeNano}} {{.Action}} {{.ID}}{% endraw %}'
-      register: authentik_readiness_name_release_events
-      changed_when: false
+        - name: Require Docker destroy evidence within the observation window
+          ansible.builtin.assert:
+            that:
+              - authentik_readiness_destroy_event.stdout_lines | length > 0
+            fail_msg: "Docker did not emit destroy for the failed-start container within the bounded observation window"
 
-    - name: Select failed-start container destroy events
-      ansible.builtin.set_fact:
-        authentik_readiness_name_release_destroy_events: >-
-          {{
-            authentik_readiness_name_release_events.stdout_lines
-            | select('search', ' destroy ')
-            | list
-          }}
+        - name: Calculate the destroy delay from the immediate restoration
+          ansible.builtin.set_fact:
+            authentik_readiness_destroy_event_time: >-
+              {{ (authentik_readiness_destroy_event.stdout_lines | first).split('|') | first | int }}
+            authentik_readiness_destroy_after_restore_seconds: >-
+              {{
+                ((authentik_readiness_destroy_event.stdout_lines | first).split('|') | first | int)
+                - (authentik_readiness_immediate_restore_t0.stdout | int)
+              }}
 
-    - name: Require Docker destroy evidence for the failed-start container
-      ansible.builtin.assert:
-        that:
-          - authentik_readiness_name_release_destroy_events | length > 0
-        fail_msg: "Docker did not retain a destroy event for the failed-start container"
+        - name: Reset the server failure before the control retry  # noqa command-instead-of-module
+          ansible.builtin.command:
+            cmd: systemctl reset-failed authentik-server.service
+          changed_when: false
 
-    - name: Report the measured Docker name-release lifecycle
-      ansible.builtin.debug:
-        msg:
-          - "{{ authentik_readiness_name_release_measurements | last }}"
-          - "DESTROY_EVENT={{ authentik_readiness_name_release_destroy_events | last }}"
-          - "DOCKER_EVENTS={{ authentik_readiness_name_release_events.stdout_lines | join(';') }}"
+        - name: Retry explicit restoration after Docker destroy  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - systemctl
+              - start
+              - "{{ authentik_readiness_test_server_service }}"
+          register: authentik_readiness_control_retry
+          changed_when: authentik_readiness_control_retry.rc == 0
+          failed_when: false
+
+        - name: Require the control retry to reach application readiness
+          ansible.builtin.assert:
+            that:
+              - authentik_readiness_control_retry.rc == 0
+            fail_msg: "The explicit control retry still failed after Docker emitted destroy"
+
+        - name: Report the measured Docker name-release lifecycle
+          ansible.builtin.debug:
+            msg:
+              - "DOCKER_ENGINE_VERSION={{ authentik_readiness_docker_engine_version.stdout }}"
+              - "IMMEDIATE_RESTORE_T0={{ authentik_readiness_immediate_restore_t0.stdout }}"
+              - "IMMEDIATE_RESTORE_RESULT=failed"
+              - "IMMEDIATE_RESTORE_FAILURE_CLASS=exact-docker-name-conflict"
+              - "DESTROY_EVENT_TIME={{ authentik_readiness_destroy_event_time }}"
+              - "DESTROY_AFTER_RESTORE_SECONDS={{ authentik_readiness_destroy_after_restore_seconds }}"
+              - "CONTROL_RETRY_RESULT=success"
+      rescue:
+        - name: Report an incomplete Docker name-release measurement
+          ansible.builtin.debug:
+            msg:
+              - "DOCKER_ENGINE_VERSION={{ authentik_readiness_docker_engine_version.stdout }}"
+              - "IMMEDIATE_RESTORE_T0={{ authentik_readiness_immediate_restore_t0.stdout | default('UNKNOWN') }}"
+              - "IMMEDIATE_RESTORE_RESULT={{ 'failed' if (authentik_readiness_immediate_restore.rc | default(0) | int) != 0 else 'unexpected-success' }}"
+              - "IMMEDIATE_RESTORE_FAILURE_CLASS={{ 'exact-docker-name-conflict' if ('Conflict. The container name' in (authentik_readiness_immediate_restore_journal.stdout | default(''))) else 'different-or-unknown' }}"
+              - "DESTROY_EVENT_TIME={{ authentik_readiness_destroy_event_time | default('NONE') }}"
+              - "DESTROY_AFTER_RESTORE_SECONDS={{ authentik_readiness_destroy_after_restore_seconds | default('NONE') }}"
+              - "CONTROL_RETRY_RESULT={{ 'success' if (authentik_readiness_control_retry.rc | default(1) | int) == 0 else ('failed' if authentik_readiness_control_retry is defined else 'not-attempted') }}"
+
+        - name: Fail the incomplete Docker name-release diagnostic
+          ansible.builtin.fail:
+            msg: "Docker name release was not measured within the bounded diagnostic path"
+      always:
+        - name: Remove the runtime restoration diagnostic override
+          ansible.builtin.file:
+            path: "{{ authentik_readiness_test_dropin_path }}"
+            state: absent
+
+        - name: Reload systemd after the restoration diagnostic
+          ansible.builtin.systemd_service:
+            daemon_reload: true
 
     - name: Verify blocking startup returned only after application readiness
       ansible.builtin.uri:
