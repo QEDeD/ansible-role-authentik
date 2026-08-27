@@ -131,6 +131,17 @@
           retries: 30
           delay: 1
 
+        - name: Record the MAINPID-test container ID before failed-start cleanup  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - docker
+              - container
+              - inspect
+              - --format={% raw %}{{.Id}}{% endraw %}
+              - "{{ authentik_readiness_test_server_container }}"
+          register: authentik_readiness_mainpid_container_id
+          changed_when: false
+
         - name: Terminate the server MAINPID during readiness polling
           ansible.builtin.command:
             cmd: "kill -TERM {{ authentik_readiness_activating_service.status.MainPID }}"
@@ -183,6 +194,30 @@
           ansible.builtin.command:
             cmd: systemctl reset-failed authentik-server.service
           changed_when: false
+
+    - name: Poll the MAINPID-test container's Docker destroy event  # noqa command-instead-of-module
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - 2s
+          - docker
+          - events
+          - --since=0
+          - "--filter=container={{ authentik_readiness_mainpid_container_id.stdout }}"
+          - --filter=event=destroy
+          - --format={% raw %}{{.Time}}|{{.Action}}|{{.ID}}{% endraw %}
+      register: authentik_readiness_mainpid_destroy_event
+      changed_when: false
+      failed_when: false
+      until: authentik_readiness_mainpid_destroy_event.stdout_lines | length > 0
+      retries: 25
+      delay: 0
+
+    - name: Require MAINPID cleanup name release before the independent timeout test
+      ansible.builtin.assert:
+        that:
+          - authentik_readiness_mainpid_destroy_event.stdout_lines | length > 0
+        fail_msg: "Docker did not finish releasing the MAINPID-test container before the timeout test"
 
     - name: Set a short startup ceiling for the timeout failure test
       ansible.builtin.copy:
