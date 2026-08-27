@@ -257,10 +257,278 @@
             cmd: systemctl reset-failed authentik-server.service
           changed_when: false
 
-    - name: Start the authentik server through the normal readiness barrier
-      ansible.builtin.systemd_service:
-        name: "{{ authentik_readiness_test_server_service }}"
-        state: started
+    - name: Restore the authentik server through the normal readiness barrier
+      block:
+        - name: Start the authentik server through the normal readiness barrier
+          ansible.builtin.systemd_service:
+            name: "{{ authentik_readiness_test_server_service }}"
+            state: started
+          register: authentik_readiness_immediate_restore
+      rescue:
+        - name: Capture concise status after the immediate restoration failure  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - systemctl
+              - status
+              - "{{ authentik_readiness_test_server_service }}"
+              - --no-pager
+              - --full
+          register: authentik_readiness_restore_status
+          changed_when: false
+          failed_when: false
+
+        - name: Capture lifecycle properties after the immediate restoration failure  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - systemctl
+              - show
+              - "{{ authentik_readiness_test_server_service }}"
+              - --property=ActiveState
+              - --property=SubState
+              - --property=Result
+              - --property=MainPID
+              - --property=ExecMainCode
+              - --property=ExecMainStatus
+              - --property=ExecStartPre
+              - --property=ExecStart
+              - --property=ExecStartPost
+              - --property=TimeoutStartUSec
+              - --property=Restart
+              - --property=RestartUSec
+              - --property=DropInPaths
+              - --property=InvocationID
+              - --property=NRestarts
+          register: authentik_readiness_restore_properties
+          changed_when: false
+          failed_when: false
+
+        - name: Read the failed restoration invocation identifier  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - systemctl
+              - show
+              - "{{ authentik_readiness_test_server_service }}"
+              - --property=InvocationID
+              - --value
+          register: authentik_readiness_restore_invocation
+          changed_when: false
+          failed_when: false
+
+        - name: Capture the failed restoration invocation journal  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - journalctl
+              - --unit={{ authentik_readiness_test_server_service }}
+              - _SYSTEMD_INVOCATION_ID={{ authentik_readiness_restore_invocation.stdout | trim }}
+              - --no-pager
+              - --output=short-iso-precise
+          register: authentik_readiness_restore_journal
+          changed_when: false
+          failed_when: false
+          when: authentik_readiness_restore_invocation.stdout | trim | length > 0
+
+        - name: Capture the short recent unit journal when the invocation is unavailable  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - journalctl
+              - --unit={{ authentik_readiness_test_server_service }}
+              - --since=-2min
+              - --no-pager
+              - --output=short-iso-precise
+              - --lines=160
+          register: authentik_readiness_restore_recent_journal
+          changed_when: false
+          failed_when: false
+          when: authentik_readiness_restore_invocation.stdout | trim | length == 0
+
+        - name: Capture the exact server container state after restoration failure  # noqa command-instead-of-module
+          ansible.builtin.command:
+            cmd: >-
+              docker container inspect
+              --format '{% raw %}{{json .State}}{% endraw %}'
+              {{ authentik_readiness_test_server_container }}
+          register: authentik_readiness_restore_container
+          changed_when: false
+          failed_when: false
+
+        - name: Report first-tier restoration failure evidence
+          ansible.builtin.debug:
+            msg:
+              immediate_start: "{{ authentik_readiness_immediate_restore }}"
+              systemd_status: "{{ authentik_readiness_restore_status.stdout_lines }}"
+              systemd_properties: "{{ authentik_readiness_restore_properties.stdout_lines }}"
+              unit_journal: >-
+                {{
+                  authentik_readiness_restore_journal.stdout_lines
+                  if authentik_readiness_restore_journal is not skipped
+                  else authentik_readiness_restore_recent_journal.stdout_lines
+                }}
+              container_state: >-
+                {{
+                  authentik_readiness_restore_container.stdout
+                  if authentik_readiness_restore_container.rc == 0
+                  else 'absent'
+                }}
+
+        - name: Classify directly implicated restoration conditions
+          ansible.builtin.set_fact:
+            authentik_readiness_restore_name_failure: >-
+              {{ authentik_readiness_restore_journal_text is search('(?i)(container name.*already in use|conflict.*container name)') }}
+            authentik_readiness_restore_port_failure: >-
+              {{ authentik_readiness_restore_journal_text is search('(?i)(port is already allocated|address already in use|bind for .* failed)') }}
+            authentik_readiness_restore_start_limit: >-
+              {{ authentik_readiness_restore_journal_text is search('(?i)(start request repeated too quickly|start-limit-hit)') }}
+            authentik_readiness_restore_postgres_failure: >-
+              {{ authentik_readiness_restore_journal_text is search('(?i)(wait_for_db|postgres|database connection)') }}
+            authentik_readiness_restore_container_present: >-
+              {{ authentik_readiness_restore_container.rc == 0 }}
+            authentik_readiness_restore_container_exited: >-
+              {{
+                authentik_readiness_restore_container.rc == 0
+                and authentik_readiness_restore_container.stdout is search('"Status":"exited"')
+              }}
+          vars:
+            authentik_readiness_restore_journal_text: >-
+              {{
+                authentik_readiness_restore_journal.stdout
+                if authentik_readiness_restore_journal is not skipped
+                else authentik_readiness_restore_recent_journal.stdout
+              }}
+
+        - name: Capture exact-name Docker events when name or container state is implicated  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - docker
+              - events
+              - --since=2m
+              - --until=0s
+              - --filter=type=container
+              - --filter=container={{ authentik_readiness_test_server_container }}
+              - --format={% raw %}{{json .}}{% endraw %}
+          register: authentik_readiness_restore_docker_events
+          changed_when: false
+          failed_when: false
+          when:
+            - >-
+              authentik_readiness_restore_name_failure
+              or authentik_readiness_restore_container_present
+
+        - name: Capture configured-port ownership when a bind failure is implicated  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - ss
+              - -H
+              - -ltnp
+              - sport = :9000
+          register: authentik_readiness_restore_port_state
+          changed_when: false
+          failed_when: false
+          when: authentik_readiness_restore_port_failure
+
+        - name: Capture exact container logs after an immediate container exit  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - docker
+              - logs
+              - "{{ authentik_readiness_test_server_container }}"
+          register: authentik_readiness_restore_container_logs
+          changed_when: false
+          failed_when: false
+          when: authentik_readiness_restore_container_exited
+
+        - name: Capture start-limit properties when systemd rate limiting is implicated  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - systemctl
+              - show
+              - "{{ authentik_readiness_test_server_service }}"
+              - --property=StartLimitBurst
+              - --property=StartLimitIntervalUSec
+              - --property=NRestarts
+          register: authentik_readiness_restore_start_limit_state
+          changed_when: false
+          failed_when: false
+          when: authentik_readiness_restore_start_limit
+
+        - name: Verify Postgres network membership when database recovery is implicated  # noqa command-instead-of-module
+          ansible.builtin.command:
+            cmd: >-
+              docker network inspect
+              --format '{% raw %}{{range .Containers}}{{println .Name}}{{end}}{% endraw %}'
+              {{ authentik_readiness_test_network }}
+          register: authentik_readiness_restore_network_members
+          changed_when: false
+          failed_when: false
+          when: authentik_readiness_restore_postgres_failure
+
+        - name: Report condition-specific restoration evidence
+          ansible.builtin.debug:
+            msg:
+              docker_events: "{{ authentik_readiness_restore_docker_events.stdout_lines | default('not-applicable') }}"
+              port_state: "{{ authentik_readiness_restore_port_state.stdout_lines | default('not-applicable') }}"
+              container_logs: "{{ authentik_readiness_restore_container_logs.stdout_lines | default('not-applicable') }}"
+              start_limit: "{{ authentik_readiness_restore_start_limit_state.stdout_lines | default('not-applicable') }}"
+              network_members: "{{ authentik_readiness_restore_network_members.stdout_lines | default('not-applicable') }}"
+
+        - name: Observe release of the implicated container name  # noqa command-instead-of-module
+          ansible.builtin.command:
+            cmd: "docker container inspect {{ authentik_readiness_test_server_container }}"
+          register: authentik_readiness_restore_name_state
+          changed_when: false
+          failed_when: false
+          until: authentik_readiness_restore_name_state.rc != 0
+          retries: 30
+          delay: 1
+          when: authentik_readiness_restore_name_failure
+
+        - name: Observe release of the implicated host port  # noqa command-instead-of-module
+          ansible.builtin.command:
+            argv:
+              - ss
+              - -H
+              - -ltnp
+              - sport = :9000
+          register: authentik_readiness_restore_port_release
+          changed_when: false
+          failed_when: false
+          until: authentik_readiness_restore_port_release.stdout | trim | length == 0
+          retries: 30
+          delay: 1
+          when: authentik_readiness_restore_port_failure
+
+        - name: Wait before the control retry when no concrete transient was identified
+          ansible.builtin.pause:
+            seconds: 30
+          when:
+            - not authentik_readiness_restore_name_failure
+            - not authentik_readiness_restore_port_failure
+
+        - name: Stop the server before the explicit control retry
+          ansible.builtin.systemd_service:
+            name: "{{ authentik_readiness_test_server_service }}"
+            state: stopped
+          failed_when: false
+
+        - name: Reset the server failure before the explicit control retry  # noqa command-instead-of-module
+          ansible.builtin.command:
+            cmd: systemctl reset-failed authentik-server.service
+          changed_when: false
+
+        - name: Retry the same explicit normal server start
+          ansible.builtin.systemd_service:
+            name: "{{ authentik_readiness_test_server_service }}"
+            state: started
+          register: authentik_readiness_control_restore
+          failed_when: false
+
+        - name: Report the explicit control retry result
+          ansible.builtin.debug:
+            var: authentik_readiness_control_restore
+
+        - name: Require the explicit control retry to restore the server
+          ansible.builtin.assert:
+            that: not (authentik_readiness_control_restore.failed | default(false))
+            fail_msg: "The explicit control retry did not restore the authentik server"
 
     - name: Verify blocking startup returned only after application readiness
       ansible.builtin.uri:
