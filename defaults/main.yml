@@ -260,15 +260,15 @@ authentik_server_readiness_command: |
 # Controls how long to wait for the container to stop gracefully before killing it.
 authentik_server_container_stop_grace_time_seconds: "{{ devture_systemd_docker_base_container_stop_grace_time_seconds }}"
 
-# Controls how long the pre-start cleanup should wait for stale container-name release
-# before failing startup explicitly.
+# Controls how many times pre-start cleanup and a transient exact-name create conflict
+# should be retried before failing startup explicitly.
 authentik_server_container_cleanup_timeout_seconds: "{{ devture_systemd_docker_base_container_cleanup_timeout_seconds }}"
 
 # Controls the delay between pre-start cleanup retries.
 authentik_server_container_cleanup_retry_delay_seconds: "{{ devture_systemd_docker_base_container_cleanup_retry_delay_seconds }}"
 
 # Shell command used in the systemd pre-start phase to deterministically remove a stale
-# container and wait until Docker releases its name.
+# container and wait until it is no longer inspectable.
 authentik_server_container_cleanup_command: |
   i=0;
   while [ "$i" -lt {{ authentik_server_container_cleanup_timeout_seconds }} ]; do
@@ -286,6 +286,33 @@ authentik_server_container_cleanup_command: |
   exit 1;
   done;
   echo "Failed to remove stale container {{ authentik_server_identifier }} after {{ authentik_server_container_cleanup_timeout_seconds }} attempts" >&2;
+  exit 1
+
+# Shell wrapper for the server container's `docker create` command. Docker may report
+# a removed container as absent before its name can be reused, so retry only that exact
+# transient conflict. Other create failures remain immediate startup failures.
+authentik_server_container_create_command: |
+  i=0;
+  while [ "$i" -lt {{ authentik_server_container_cleanup_timeout_seconds }} ]; do
+  if create_output=$("$@" 2>&1); then
+  echo "$create_output";
+  exit 0;
+  fi;
+  case "$create_output" in
+  *"Conflict. The container name"*"is already in use by container"*)
+  i=$((i + 1));
+  if [ "$i" -lt {{ authentik_server_container_cleanup_timeout_seconds }} ]; then
+  sleep {{ authentik_server_container_cleanup_retry_delay_seconds }};
+  fi;
+  ;;
+  *)
+  echo "$create_output" >&2;
+  exit 1;
+  ;;
+  esac;
+  done;
+  echo "$create_output" >&2;
+  echo "Failed to create container {{ authentik_server_identifier }} after {{ authentik_server_container_cleanup_timeout_seconds }} attempts because Docker did not release its name" >&2;
   exit 1
 
 ########################################################################

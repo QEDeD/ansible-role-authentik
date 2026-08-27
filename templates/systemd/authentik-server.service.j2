@@ -18,7 +18,8 @@ DefaultDependencies=no
 Type=simple
 ExecStartPre={{ devture_systemd_docker_base_host_command_sh }} -c '{{ authentik_server_container_cleanup_command | trim | replace("\n", " ") }}'
 
-ExecStartPre={{ devture_systemd_docker_base_host_command_docker }} create \
+ExecStartPre={{ devture_systemd_docker_base_host_command_sh }} -c '{{ authentik_server_container_create_command | trim | replace("\n", " ") }}' authentik-server-container-create \
+      {{ devture_systemd_docker_base_host_command_docker }} create \
       --rm \
       --name={{ authentik_server_identifier }} \
       --log-driver=none \
