@@ -19,6 +19,18 @@
     authentik_readiness_test_url: http://localhost:9000/-/health/ready/
 
   tasks:
+    - name: Read the Docker Engine version used by the lifecycle diagnostic  # noqa command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          docker version --format
+          '{% raw %}{{.Server.Version}}{% endraw %}'
+      register: authentik_readiness_docker_engine_version
+      changed_when: false
+
+    - name: Report the Docker Engine version used by the lifecycle diagnostic
+      ansible.builtin.debug:
+        msg: "DOCKER_ENGINE_VERSION={{ authentik_readiness_docker_engine_version.stdout }}"
+
     - name: Read the installed authentik server unit  # noqa command-instead-of-module
       ansible.builtin.command:
         cmd: systemctl cat authentik-server.service
@@ -185,6 +197,12 @@
       ansible.builtin.systemd_service:
         daemon_reload: true
 
+    - name: Record the start of the timeout-failure lifecycle observation  # noqa command-instead-of-module
+      ansible.builtin.command:
+        cmd: date +%s
+      register: authentik_readiness_name_release_observation_start
+      changed_when: false
+
     - name: Verify the startup ceiling fails readiness and removes the container
       block:
         - name: Disconnect Postgres to hold authentik below readiness until timeout  # noqa command-instead-of-module
@@ -263,6 +281,73 @@
       ansible.builtin.systemd_service:
         name: "{{ authentik_readiness_test_server_service }}"
         state: started
+
+    - name: Read the measured create-retry lifecycle from the server journal  # noqa command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          journalctl
+          --unit={{ authentik_readiness_test_server_service }}
+          --since=@{{ authentik_readiness_name_release_observation_start.stdout }}
+          --no-pager
+          --output=cat
+      register: authentik_readiness_name_release_journal
+      changed_when: false
+
+    - name: Select successful exact-name-conflict measurements
+      ansible.builtin.set_fact:
+        authentik_readiness_name_release_measurements: >-
+          {{
+            authentik_readiness_name_release_journal.stdout_lines
+            | select('match', '^AUTHENTIK_NAME_RELEASE .* FIRST_CREATE_SUCCESS=[^N]')
+            | list
+          }}
+
+    - name: Require the immediate restoration to exercise and recover from the name conflict
+      ansible.builtin.assert:
+        that:
+          - authentik_readiness_name_release_measurements | length > 0
+        fail_msg: >-
+          The immediate restoration did not produce a successful exact-name-conflict
+          measurement within the diagnostic window.
+
+    - name: Record the end of the timeout-failure lifecycle observation  # noqa command-instead-of-module
+      ansible.builtin.command:
+        cmd: date +%s
+      register: authentik_readiness_name_release_observation_end
+      changed_when: false
+
+    - name: Read Docker events for the failed-start and restoration lifecycle  # noqa command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          docker events
+          --since={{ authentik_readiness_name_release_observation_start.stdout }}
+          --until={{ authentik_readiness_name_release_observation_end.stdout }}
+          --filter=container={{ authentik_readiness_test_server_container }}
+          --format='{% raw %}{{.TimeNano}} {{.Action}} {{.ID}}{% endraw %}'
+      register: authentik_readiness_name_release_events
+      changed_when: false
+
+    - name: Select failed-start container destroy events
+      ansible.builtin.set_fact:
+        authentik_readiness_name_release_destroy_events: >-
+          {{
+            authentik_readiness_name_release_events.stdout_lines
+            | select('search', ' destroy ')
+            | list
+          }}
+
+    - name: Require Docker destroy evidence for the failed-start container
+      ansible.builtin.assert:
+        that:
+          - authentik_readiness_name_release_destroy_events | length > 0
+        fail_msg: "Docker did not retain a destroy event for the failed-start container"
+
+    - name: Report the measured Docker name-release lifecycle
+      ansible.builtin.debug:
+        msg:
+          - "{{ authentik_readiness_name_release_measurements | last }}"
+          - "DESTROY_EVENT={{ authentik_readiness_name_release_destroy_events | last }}"
+          - "DOCKER_EVENTS={{ authentik_readiness_name_release_events.stdout_lines | join(';') }}"
 
     - name: Verify blocking startup returned only after application readiness
       ansible.builtin.uri:
